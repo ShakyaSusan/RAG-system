@@ -1,0 +1,12 @@
+fastapi
+uvicorn[standard]
+python-multipart
+pydantic[email]
+pydantic-settings
+sqlalchemy[asyncio]
+psycopg2-binary
+qdrant-client
+redis
+openai
+pypdf
+email-validator

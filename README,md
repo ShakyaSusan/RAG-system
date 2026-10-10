@@ -1,0 +1,342 @@
+# Conversational RAG Backend
+
+A FastAPI backend with two REST APIs:
+
+1. **Document Ingestion API**: upload `.pdf` / `.txt` files, extract text, chunk with a selectable strategy, embed, store vectors in **Qdrant**, and save metadata in **PostgreSQL**.
+2. **Conversational RAG API**: a custom (no `RetrievalQAChain`) multi-turn RAG pipeline with **Redis** chat memory and LLM-driven **interview booking**.
+
+LLM calls use the **Groq API**. Embeddings are generated locally with **sentence-transformers** (`all-MiniLM-L6-v2`).
+
+---
+
+## Tech stack
+
+| Concern | Choice |
+|---|---|
+| Web framework | FastAPI + Pydantic v2 |
+| LLM | Groq (OpenAI-compatible endpoint) |
+| Embeddings | `sentence-transformers/all-MiniLM-L6-v2` (384 dimensions, runs locally) |
+| Vector store | Qdrant |
+| Metadata and bookings | PostgreSQL via SQLAlchemy 2.0 |
+| Chat memory | Redis |
+| PDF parsing | pypdf |
+
+---
+
+## Architecture
+
+```mermaid
+flowchart LR
+    subgraph Ingestion
+        U[Upload PDF/TXT] --> P[Parse text]
+        P --> C[Chunk: fixed or sentence]
+        C --> E[Embed locally]
+        E --> Q[(Qdrant)]
+        C --> M[(PostgreSQL metadata)]
+    end
+
+    subgraph Chat
+        A[User message] --> H[(Redis history)]
+        A --> B{Booking flow?}
+        B -- yes --> S[Slot filling via LLM]
+        S --> D[(PostgreSQL bookings)]
+        S --> R[(Redis booking state)]
+        B -- no --> CQ[Condense question]
+        CQ --> EQ[Embed query]
+        EQ --> Q
+        Q --> G[Generate answer with Groq]
+    end
+```
+
+### Request flow for `/chat`
+
+1. Load the last N messages for the `session_id` from Redis.
+2. Run the booking handler. If the message is part of a booking flow, it replies and the RAG step is skipped.
+3. Otherwise, **condense** the follow-up into a standalone question, **retrieve** the top-k chunks from Qdrant, and **generate** an answer grounded in that context.
+4. Save the user message and the reply back to Redis.
+
+---
+
+## Project structure
+
+```
+app/
+|-- main.py                  # app factory, lifespan (creates tables and Qdrant collection)
+|-- core/config.py           # typed settings from environment
+|-- api/
+|   |-- ingestion.py         # POST /ingest
+|   `-- chat.py              # POST /chat
+|-- schemas/                 # Pydantic request/response models
+|-- db/
+|   |-- session.py           # engine and session dependency
+|   `-- models.py            # Document, Booking
+`-- services/
+    |-- parsing.py           # PDF/TXT to text
+    |-- chunking.py          # two chunking strategies
+    |-- embeddings.py        # sentence-transformers wrapper
+    |-- vector_store.py      # Qdrant wrapper
+    |-- memory.py            # Redis chat history and booking state
+    |-- llm.py               # Groq client wrapper
+    |-- booking.py           # slot filling and persistence
+    `-- rag.py               # condense, retrieve, generate
+```
+
+Routes handle HTTP only, services hold the logic, and schemas define the data shapes.
+
+---
+
+## Getting started
+
+### Prerequisites
+
+- Python 3.11+
+- Docker and Docker Compose
+- A [Groq API key](https://console.groq.com/keys)
+
+### 1. Clone and install
+
+```bash
+git clone <your-repo-url>
+cd <repo-folder>
+
+python -m venv .venv
+source .venv/bin/activate        # Windows: .venv\Scripts\activate
+
+python -m pip install -r requirements.txt
+```
+
+`requirements.txt` should include:
+
+```
+fastapi
+uvicorn[standard]
+python-multipart
+pydantic-settings
+sqlalchemy
+psycopg2-binary
+qdrant-client
+redis
+openai
+pypdf
+email-validator
+sentence-transformers
+```
+
+> The Groq endpoint is OpenAI-compatible, so the `openai` SDK is used with a custom `base_url`.
+> The first run downloads the embedding model (about 90 MB) from Hugging Face.
+
+### 2. Start infrastructure
+
+```bash
+docker compose up -d
+```
+
+This starts Qdrant (`6333`), Redis (`6379`) and PostgreSQL (`5432`).
+
+### 3. Configure environment
+
+Copy `.env.example` to `.env` and fill in your key:
+
+```bash
+cp .env.example .env
+```
+
+```env
+# LLM (Groq)
+GROQ_API_KEY=your_groq_api_key
+GROQ_BASE_URL=https://api.groq.com/openai/v1
+CHAT_MODEL=llama-3.3-70b-versatile
+
+# Embeddings (local)
+EMBEDDING_MODEL=sentence-transformers/all-MiniLM-L6-v2
+EMBEDDING_DIM=384
+
+# Infrastructure
+QDRANT_URL=http://localhost:6333
+QDRANT_COLLECTION=documents
+REDIS_URL=redis://localhost:6379/0
+DATABASE_URL=postgresql://app:app@localhost:5432/app
+
+# Chat memory
+CHAT_HISTORY_LIMIT=10
+SESSION_TTL_SECONDS=3600
+```
+
+Adjust the variable names if your `config.py` uses different ones.
+
+> **Important:** `all-MiniLM-L6-v2` produces **384-dimensional** vectors. If you previously created the Qdrant collection with a different size (for example 1536 for OpenAI embeddings), delete the collection or the Qdrant volume and let the app recreate it, otherwise upserts will fail.
+>
+> ```bash
+> curl -X DELETE http://localhost:6333/collections/documents
+> ```
+
+### 4. Run the server
+
+```bash
+uvicorn app.main:app --reload
+```
+
+Interactive docs: <http://localhost:8000/docs>
+
+---
+
+## API reference
+
+### `POST /ingest`
+
+Upload a document and index it.
+
+| Field | Type | Description |
+|---|---|---|
+| `file` | file | `.pdf` or `.txt` |
+| `strategy` | form field | `fixed` (default) or `sentence` |
+
+```bash
+curl -X POST http://localhost:8000/ingest \
+  -F "file=@nimbus_handbook.pdf" \
+  -F "strategy=fixed"
+```
+
+Response:
+
+```json
+{
+  "document_id": "3f0c1c2e-...",
+  "filename": "nimbus_handbook.pdf",
+  "chunk_strategy": "fixed",
+  "chunk_count": 9
+}
+```
+
+Errors: `400` for unsupported file types, `422` if no text could be extracted.
+
+### `POST /chat`
+
+Send a message within a session. Reuse the same `session_id` for multi-turn conversations.
+
+```bash
+curl -X POST http://localhost:8000/chat \
+  -H "Content-Type: application/json" \
+  -d '{"session_id": "test1", "message": "How many days of annual leave do employees get?"}'
+```
+
+Response:
+
+```json
+{
+  "session_id": "test1",
+  "reply": "Full-time employees receive 18 days of paid annual leave per year."
+}
+```
+
+#### Multi-turn example
+
+```bash
+curl -s -X POST localhost:8000/chat -H "Content-Type: application/json" \
+  -d '{"session_id":"s1","message":"Tell me about the Nimbus Chat product."}'
+
+curl -s -X POST localhost:8000/chat -H "Content-Type: application/json" \
+  -d '{"session_id":"s1","message":"What does it cost?"}'
+```
+
+The second message is rewritten to a standalone question before retrieval, so "it" resolves to Nimbus Chat.
+
+#### Interview booking example
+
+```bash
+curl -s -X POST localhost:8000/chat -H "Content-Type: application/json" \
+  -d '{"session_id":"b1","message":"I would like to book an interview."}'
+
+curl -s -X POST localhost:8000/chat -H "Content-Type: application/json" \
+  -d '{"session_id":"b1","message":"My name is Priya Sharma, priya@example.com"}'
+
+curl -s -X POST localhost:8000/chat -H "Content-Type: application/json" \
+  -d '{"session_id":"b1","message":"Next Monday at 3 PM"}'
+```
+
+The assistant asks for whichever of name, email, date and time are still missing, then saves the booking.
+
+---
+
+## Design decisions
+
+### Chunking strategies
+
+| Strategy | How it works | Pros | Cons |
+|---|---|---|---|
+| `fixed` | Fixed character windows (800 chars) with 100-char overlap | Predictable size, simple, fast | Can cut sentences in half |
+| `sentence` | Splits on sentence boundaries and packs sentences up to 800 chars | Chunks stay semantically coherent | Chunk sizes vary |
+
+Overlap in the fixed strategy keeps context from being lost at chunk boundaries.
+
+### Custom RAG (no `RetrievalQAChain`)
+
+The pipeline is written by hand in `services/rag.py`:
+
+1. **Condense:** a short LLM call rewrites a follow-up like "what about its pricing?" into a standalone question. Raw follow-ups embed poorly because they depend on earlier turns.
+2. **Retrieve:** embed the standalone question and run a cosine-similarity search in Qdrant.
+3. **Generate:** answer using only the retrieved context plus recent history. If the answer is not in the context, the model says it does not know.
+
+### Why local embeddings
+
+Groq does not provide an embeddings endpoint, so embeddings use `sentence-transformers`. `all-MiniLM-L6-v2` is small, fast on CPU and free to run, with normalized vectors used with cosine distance in Qdrant.
+
+### Why Qdrant and PostgreSQL
+
+They do different jobs. Qdrant handles similarity search over vectors, while PostgreSQL stores relational records (document metadata and bookings).
+
+### Redis for memory and booking state
+
+- Chat history is a Redis list per session, trimmed to the last N messages with a TTL.
+- Partial booking details are stored separately in Redis. This makes slot filling deterministic across turns instead of depending on the LLM re-reading the whole history.
+
+### Booking flow
+
+1. The LLM extracts `name`, `email`, `date` and `time` from each message and flags booking intent (JSON mode).
+2. Extracted values are merged into the session's booking state in Redis.
+3. Missing fields are requested from the user.
+4. When complete, Pydantic validates the data (`EmailStr`, `date`, `time`), the booking is saved to PostgreSQL, and the state is cleared.
+
+---
+
+## Data model
+
+**documents:** `id`, `filename`, `file_type`, `chunk_strategy`, `chunk_count`, `created_at`
+
+**bookings:** `id`, `name`, `email`, `date`, `time`, `created_at`
+
+Qdrant payload per chunk: `document_id`, `chunk_index`, `text`
+
+---
+
+## Code quality
+
+- Fully type-annotated; check with `mypy app/`
+- Lint and format with `ruff check .` and `ruff format .`
+- Pydantic models for all request/response bodies and settings
+
+```bash
+python -m pip install mypy ruff pytest
+mypy app/
+ruff check .
+pytest
+```
+
+---
+
+## Known limitations and future improvements
+
+- Synchronous service clients; moving to async clients would improve throughput.
+- No reranking step; a cross-encoder could improve retrieval quality.
+- Retrieval searches all documents; adding a `document_id` filter would allow scoped questions.
+- No authentication or rate limiting.
+- Character-based chunk sizes; token-based chunking would align better with model limits.
+- Scanned PDFs are not supported (no OCR).
+- Embedding and ingestion run inside the request; a background worker queue would suit large files.
+- Booking confirmation is stored, but no email is actually sent.
+
+---
+
+## License
+
+MIT
